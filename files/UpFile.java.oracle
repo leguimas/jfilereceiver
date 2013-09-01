@@ -1,0 +1,230 @@
+package jfilereceiver.files;
+
+import java.io.*;
+import java.util.*;
+import jfilereceiver.conf.*;
+import jfilereceiver.general.*;
+
+/**
+ * Title:        UpFile
+ * Description:  Classe que realiza o processamento dos arquivos UP*.
+ * Copyright:    Copyright (c) 2002
+ * Company:      Embralog
+ * @author       Gordo&#153;
+ * @version      1.0
+ */
+
+public class UpFile extends GeneralFile {
+
+  // constantes
+  static final String ID_APPLICATION = "UPFILE";
+  static final String DETAIL_REGISTRY = "1";
+
+  // constantes sobre os erros de banco de dados
+  static final int JFR_ERROR_IRREGULAR_FILE = 1;
+  static final int JFR_ERROR_DUPLICATE_FILE = 56;
+
+  /**
+   * Método responsável por realizar a inserção dos dados em FILA_RECEPCAO.
+   *
+   * @author Gordo&#153;
+   * @param  _txtVersion informações sobre a versão do arquivo que está sendo manipulado
+   * @param  _values valores a serem inseridos
+   * @param  _tipIrrCodigo tipo da irregularidade
+   */
+  public void newUpRegistry (TxtVersion _txtVersion, LinkedList _values, String _tipIrrCodigo,
+                             String _upFileType, String _version) throws Exception {
+    // montando a query a ser executada
+    String query = new String("");
+    query = "insert into DATASTRIPPROCQUEUE\n" +
+            "  (DSQ_ID,\n" +
+            "   DSQ_SYSDATE,\n" +
+            "   DSQ_IRREGULARITYCODE,\n" +
+            "   DSQ_FILETYPE,\n" +
+            "   DSQ_DATAVERSION,\n" +
+            databaseTools.getStringColumns(_txtVersion) + ")\n" +
+            "  values (" + util.NewId.get(newIdUrl, this.ID_APPLICATION) + ",\n" +
+            "           sysdate,\n" +
+                        _tipIrrCodigo + ",\n" +
+            "           '" + _upFileType + "',\n" +
+            "           '" + _version + "',\n " +
+            databaseTools.getStringColumns(_txtVersion, _values) + ")";
+    // obtendo as informações sobre a conexão para realizar a transação
+    int connHandler = this.connectionPool.getConnectionHandler();
+    databaseTools.execute(this.connectionPool, query, connHandler);
+    // commita a operação
+    databaseTools.execute(this.connectionPool, "commit", connHandler);
+    // libera a conexão utilizada
+    this.connectionPool.freeConnection(connHandler);
+  }
+
+  /**
+   * Método responsável por obter o código da irregularidade.
+   *
+   * @author Gordo&#153;
+   * @param  _textException texto da exceção
+   * @return código da irregularidade
+   */
+  public int getIrregularCode (String _textException) {
+    int result = JFR_ERROR_IRREGULAR_FILE;
+    // verifica se o erro foi o de duplicate key
+    if (_textException.indexOf("duplicate key") >= 0)
+      result = JFR_ERROR_DUPLICATE_FILE;
+    else if (_textException.indexOf("foreign key") >= 0)
+      result = -1;
+    return result;
+  }
+
+  /**
+   * Método run da Thread. Fica realizando processamento de arquivos UP. O processamento
+   * do arquivo consiste em coletar as informações do mesmo e colocá-las em um
+   * banco de dados. Caso a operação ocorra com sucesso, o arquivo é movido para
+   * o diretório processedDir. Caso ocorra algum erro durante o processamento, o
+   * arquivo é movido para a pasta irregularDir. A thread fica sendo executada
+   * ate a propriedade stop ser igual a true.
+   *
+   * @author Gordo&#153;
+   */
+  public void run () {
+    // variável utilizada para leitura do arquivo
+    BufferedReader fileReader = null;
+    // setando o log para o processamento deste tipo de arquivo
+    this.setLogProcess();
+    logProcess.log("[jFileReceiver.files.UpFile] Startada uma thread para processamento " + this.getFilePattern() + ".", logProcess.logGenerator.STATUS);
+    boolean getOpen = false;
+    irregular = false;
+    // enquanto a Thread não for setada para parar
+    while (! stop) {
+      // se a thread estiver ativa
+      if (this.active) {
+        logProcess.log("[jFileReceiver.files.UpFile] Iniciado o processamento do arquivo " + file2Process.getPath() + ".", logProcess.logGenerator.STATUS);
+        // tenta abrir o arquivo para leitura
+        try {
+          fileReader = new BufferedReader (new FileReader (file2Process));
+          // seta variável indicando sucesso na abertura do arquivo
+          getOpen = true;
+        }
+        catch (Exception fileException) {
+          try {
+            logProcess.log("[jFileReceiver.files.UpFile] Erro na abertura do arquivo " + file2Process.getPath() + ". " + fileException.toString() + ". O arquivo será colocado na pasta de arquivos irregulares: " + validFile.getIrregularHomeOutBoxDir(), logProcess.logGenerator.ERROR);
+            logApplication.log("[jFileReceiver.files.UpFile] Erro na abertura do arquivo " + file2Process.getPath() + ". " + fileException.toString() + ". O arquivo será colocado na pasta de arquivos irregulares: " + validFile.getIrregularHomeOutBoxDir(), logApplication.logGenerator.ERROR);
+          }
+          catch (Exception ex) {
+          }
+          // seta variável indicando falha na abertura do arquivo
+          getOpen = false;
+        }
+        // se não ocorreu problemas na abertura do arquivo
+        if (getOpen) {
+          // obtém o tipo do arquivo UP
+          // as 3 primeiras letras do nome do arquivo, identificam o tipo do mesmo. Como o arquivo está
+          // lockado (com um _ no começo) pega-se os caracteres da posição 1 até a posição 3
+          try {
+            String upFileType = file2Process.getName().substring(1, 4).toUpperCase();
+            int indexLine = 1;
+            // percorrendo todas as linhas do arquivo texto
+            for (String line = fileReader.readLine(); line != null; line = fileReader.readLine()) {
+              try {
+                // verifica se a linha atual é uma linha de detalhes
+                if (DETAIL_REGISTRY.equals(line.substring(0,1))) {
+                  // obtendo a versão do arquivo a qual essa linha se refere
+                  int indexVersion = this.getVersion(line.length());
+                  if (indexVersion < 0)
+                    throw new Exception ("Não foi encontrada nenhuma versão de arquivo " + validFile.getFilePattern() + " para a linhas com tamanho " + line.length() + ".");
+                  try {
+                    // Obtém as informações sobre a versão encontrada
+                    FileVersion fileVersion = validFile.getFileVersions(indexVersion);
+                    TxtVersion txtVersion = fileVersion.getTxtVersion();
+                    LinkedList fieldValues = new LinkedList();
+                    TxtFieldInformation fieldInformation = new TxtFieldInformation();
+                    // percorre as informações do vetor para obter os valores contidos na linha do arquivo
+                    for (int indexField = 0; indexField < txtVersion.getFieldsInformationSize(); indexField ++) {
+                      fieldInformation = txtVersion.getTxtFieldInformation(indexField);
+                      fieldValues.add(indexField, line.substring(fieldInformation.getInitialPosition(), fieldInformation.getFinalPosition() + 1).trim());
+                    }
+                    // realiza a inserção das informações no banco
+                    try {
+                      this.newUpRegistry(txtVersion, fieldValues, "null", upFileType, fileVersion.getCodeVersion());
+                      irregular = false;
+                      // colocando o arquivo no arquivo de saída de linhas processadas
+                      this.outputLine(line, true, indexLine);
+                    }
+                    // tratando algum problema de SQL
+                    catch (Exception sqlException) {
+                      irregular = true;
+                      int irrCodigo = this.getIrregularCode(sqlException.toString());
+                      // registra a irregularidade
+                      if (irrCodigo > 0) {
+                        try {
+                          this.newUpRegistry(txtVersion, fieldValues, new Integer(irrCodigo).toString(), upFileType, fileVersion.getCodeVersion());
+                        }
+                        // tratando problemas ao se registrar a irregularidade da linha
+                        catch (Exception irrException) {
+                          logProcess.log("[jFileReceiver.files.UpFile] Erro na tentativa de se gravar a irregularidade do arquivo " + file2Process.getPath() + ". " + irrException.toString() + ". Esta linha (" + indexLine + ") está sendo colocada no arquivo de linhas irregulares.", logProcess.logGenerator.ERROR);
+                          logApplication.log("[jFileReceiver.files.UpFile] Erro na tentativa de se gravar a irregularidade do arquivo " + file2Process.getPath() + ". " + irrException.toString() + ". Esta linha (" + indexLine + ") está sendo colocada no arquivo de linhas irregulares.", logApplication.logGenerator.ERROR);
+                          this.outputLine(line, false, indexLine);
+                        }
+                      }
+                      // caso a irregularidade seja problema de FK
+                      else {
+                        logProcess.log("[jFileReceiver.files.UpFile] As informações da linha " + indexLine + " contida no arquivo " + file2Process.getPath() + ". " + sqlException.toString() + ". Esta linha está sendo colocada no arquivo de linhas irregulares.", logProcess.logGenerator.ERROR);
+                        logApplication.log("[jFileReceiver.files.UpFile] As informações da linha " + indexLine + " contida no arquivo " + file2Process.getPath() + ". " + sqlException.toString() + ". Esta linha está sendo colocada no arquivo de linhas irregulares.", logApplication.logGenerator.ERROR);
+                        this.outputLine(line, false, indexLine);
+                      }
+                    }
+                  }
+                  catch (Exception fileProcessException) {
+                    irregular = true;
+                    logProcess.log("[jFileReceiver.files.UpFile] Erro no processamento da linha " + indexLine + " do arquivo " +  file2Process.getPath() + ". " + fileProcessException.toString(), logProcess.logGenerator.ERROR);
+                    logApplication.log("[jFileReceiver.files.UpFile] Erro no processamento da linha " + indexLine + " do arquivo " +  file2Process.getPath() + ". " + fileProcessException.toString(), logApplication.logGenerator.ERROR);
+                    this.outputLine(line, false, indexLine);
+                  }
+                }
+                indexLine ++;
+              }
+              catch (Exception versionException) {
+                irregular = true;
+                logProcess.log("[jFileReceiver.files.UpFile] Erro na obtenção da versão para a linha " + indexLine + " do arquivo " +  file2Process.getPath() + ". " + versionException.toString(), logProcess.logGenerator.ERROR);
+                logApplication.log("[jFileReceiver.files.UpFile] Erro na obtenção da versão para a linha " + indexLine + " do arquivo " +  file2Process.getPath() + ". " + versionException.toString(), logApplication.logGenerator.ERROR);
+                this.outputLine(line, false, indexLine);
+              }
+            }
+            // deslocka o arquivo que foi processado
+            try {
+              fileReader.close();
+              // finaliza o processamento do arquivo
+              this.endProcess(irregular, errorProcess);
+            }
+            catch (Exception unlockException) {
+              logProcess.log("[jFileReceiver.files.UpFile] Problemas na manipulação do arquivo " + file2Process.getPath() + ". " + unlockException.toString() + ". Caso o arquivo esteja lockado, desloque-o e coloque no diretório " + validFile.getProcessedHomeOutBoxDir() + " e uma cópia no diretório " + validFile.getIrregularHomeOutBoxDir() + ".", logProcess.logGenerator.ERROR);
+              logApplication.log("[jFileReceiver.files.UpFile] Problemas na manipulação do arquivo " + file2Process.getPath() + ". " + unlockException.toString() + ". Caso o arquivo esteja lockado, desloque-o e coloque no diretório " + validFile.getProcessedHomeOutBoxDir() + " e uma cópia no diretório " + validFile.getIrregularHomeOutBoxDir() + ".", logApplication.logGenerator.ERROR);
+            }
+          }
+          catch (Exception stringException) {
+            logProcess.log("[jFileReceiver.files.UpFile] Erro na obtenção do tipo do arquivo " + file2Process.getPath() + ". " + stringException.toString() + ". O mesmo será deslockado.", logProcess.logGenerator.ERROR);
+            this.endProcess(true, false);
+          }
+        }
+        // caso ocorreu algum problema, move o arquivo para o diretorio de arquivos irregulares
+        else {
+          this.endProcess(true, false);
+        }
+        // seta o horário do último acesso a esta thread
+        this.lastAccess.setTime(System.currentTimeMillis());
+        // pausa a thread para que outro processo possa usá-lo
+        this.active = false;
+        this.errorProcess = false;
+      }
+      // sleep para evitar 100% de CPU
+      try {
+        Thread.sleep(this.sleepTime);
+      }
+      catch (Exception sleepException) {
+        logApplication.log("[jFileReceiver.files.UpFile] Problemas no sleep da thread UpFile: " + sleepException.toString(), logApplication.logGenerator.ATTENTION);
+        logProcess.log("[jFileReceiver.files.UpFile] Problemas no sleep da thread UpFile: " + sleepException.toString(), logApplication.logGenerator.ATTENTION);
+      }
+    }
+    logProcess.log("[jFileReceiver.files.UpFile] Finalizada uma thread para processamento " + this.getFilePattern() + ".", logApplication.logGenerator.STATUS);
+  }
+
+}
